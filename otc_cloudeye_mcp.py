@@ -2,15 +2,14 @@
 # dependencies = [
 #     "fastmcp",
 #     "requests",
-#     "pydantic",
-#     "python-dotenv",
+#     "pyyaml",
 # ]
 # ///
 
 """
 OTC Telekom Cloud MCP Server for AGT Metrics
-Refactored to use FastMCP (NO unicorn/FastAPI)
-Provides access to AGT.ECS namespace metrics from OTC Cloud Eye service
+Refactored to use FastMCP and dynamic clouds.yaml configuration.
+Supports OS_CLIENT_CONFIG_FILE environment variable.
 """
 
 import os
@@ -18,7 +17,9 @@ import time
 import datetime
 import logging
 import json
+import yaml
 from typing import Any, Dict, List, Optional
+from pathlib import Path
 import requests
 from fastmcp import FastMCP
 
@@ -56,6 +57,71 @@ ALL_METRICS = {
     "AGT.ECS": AGT_METRICS,
     "SYS.ECS": ECS_METRICS
 }
+
+# --- Configuration Loading ---
+
+def load_clouds_yaml(cloud_name: str = "otc") -> Dict[str, Any]:
+    """
+    Load cloud configuration.
+    Priority 1: OS_CLIENT_CONFIG_FILE environment variable.
+    Priority 2: Standard OpenStack search paths.
+    """
+    
+    # Check for explicit environment variable override
+    custom_path_env = os.getenv("OS_CLIENT_CONFIG_FILE")
+    search_paths = []
+    
+    if custom_path_env:
+        custom_path = Path(custom_path_env)
+        if not custom_path.exists():
+            raise FileNotFoundError(f"OS_CLIENT_CONFIG_FILE is set to '{custom_path}' but file does not exist.")
+        search_paths.append(custom_path)
+        logger.info(f"Using configuration file from OS_CLIENT_CONFIG_FILE: {custom_path}")
+    else:
+        # Standard OpenStack paths
+        search_paths = [
+            Path.cwd() / "clouds.yaml",
+            Path.home() / ".config" / "openstack" / "clouds.yaml",
+            Path("/etc/openstack/clouds.yaml")
+        ]
+
+    config = None
+    used_path = None
+
+    for path in search_paths:
+        if path.exists():
+            try:
+                with open(path, "r") as f:
+                    data = yaml.safe_load(f)
+                    if data and "clouds" in data and cloud_name in data["clouds"]:
+                        config = data["clouds"][cloud_name]
+                        used_path = path
+                        break
+            except Exception as e:
+                logger.warning(f"Error reading {path}: {e}")
+                # If explicit path was given and failed to parse, we should probably fail hard
+                if custom_path_env:
+                    raise ValueError(f"Failed to parse explicitly requested config file {path}: {e}")
+
+    if not config:
+        if custom_path_env:
+            raise ValueError(f"Cloud '{cloud_name}' not found in {custom_path_env}")
+        else:
+            raise FileNotFoundError(f"Could not find configuration for cloud '{cloud_name}' in standard locations.")
+
+    logger.info(f"Loaded '{cloud_name}' configuration from {used_path}")
+    
+    # Extract Auth details
+    auth = config.get("auth", {})
+    
+    return {
+        "auth_url": auth.get("auth_url"),
+        "username": auth.get("username"),
+        "password": auth.get("password"),
+        "domain_name": auth.get("user_domain_name") or auth.get("domain_name"),
+        "project_name": auth.get("project_name"),
+        "region": config.get("region_name", "eu-de")
+    }
 
 # --- Client Logic (Preserved) ---
 
@@ -102,7 +168,9 @@ class OTCCloudEyeClient:
         
         headers = {"Content-Type": "application/json"}
         try:
-            response = requests.post(f"{self.auth_url}/auth/tokens", 
+            # Clean auth_url if it ends with slash
+            base_url = self.auth_url.rstrip('/')
+            response = requests.post(f"{base_url}/auth/tokens", 
                                     json=auth_data, 
                                     headers=headers,
                                     timeout=30)
@@ -127,7 +195,7 @@ class OTCCloudEyeClient:
             return self.authenticate()
             
         try:
-            # Handle potential timezone issues safely
+            # Handle timestamps safely
             expiry_time = datetime.datetime.strptime(self.token_expires, "%Y-%m-%dT%H:%M:%S.%fZ")
             current_time = datetime.datetime.utcnow()
             
@@ -141,7 +209,6 @@ class OTCCloudEyeClient:
         
     def list_projects(self) -> Optional[List[Dict]]:
         """List all available projects for the authenticated user"""
-        # First authenticate without project scope to get domain-scoped token
         auth_data = {
             "auth": {
                 "identity": {
@@ -166,7 +233,8 @@ class OTCCloudEyeClient:
         
         headers = {"Content-Type": "application/json"}
         try:
-            response = requests.post(f"{self.auth_url}/auth/tokens", 
+            base_url = self.auth_url.rstrip('/')
+            response = requests.post(f"{base_url}/auth/tokens", 
                                     json=auth_data, 
                                     headers=headers,
                                     timeout=30)
@@ -174,8 +242,7 @@ class OTCCloudEyeClient:
             if response.status_code == 201:
                 domain_token = response.headers['X-Subject-Token']
                 
-                # Now list projects using domain-scoped token
-                projects_url = f"{self.auth_url}/auth/projects"
+                projects_url = f"{base_url}/auth/projects"
                 headers = {
                     "Content-Type": "application/json",
                     "X-Auth-Token": domain_token
@@ -199,7 +266,6 @@ class OTCCloudEyeClient:
     def set_project(self, project_name: str) -> bool:
         """Set the project for subsequent operations"""
         self.project_name = project_name
-        # Re-authenticate to get new project scoped token
         return self.authenticate()
 
     def list_servers(self) -> Optional[List[Dict]]:
@@ -227,7 +293,7 @@ class OTCCloudEyeClient:
             return None
         
     def query_ecs_metrics(self, instance_id: str = None) -> Optional[Dict]:
-        """Query ECS metrics availability from Cloud Eye"""
+        """Query ECS metrics availability"""
         if not self.check_token_validity():
             return None
             
@@ -256,7 +322,7 @@ class OTCCloudEyeClient:
             return None
 
     def query_agt_metrics(self, instance_id: str = None) -> Optional[Dict]:
-        """Query AGT metrics availability from Cloud Eye"""
+        """Query AGT metrics availability"""
         if not self.check_token_validity():
             return None
             
@@ -322,7 +388,6 @@ class OTCCloudEyeClient:
 
     def get_all_ecs_metrics_data(self, instance_id: str, from_time: int, to_time: int) -> Dict:
         """Get all ECS (SYS.ECS) metrics data for an instance"""
-        # Using the constant list ECS_METRICS to drive this loop
         results = {}
         
         for metric_conf in ECS_METRICS:
@@ -360,34 +425,47 @@ class OTCCloudEyeClient:
 otc_client: Optional[OTCCloudEyeClient] = None
 
 def get_client() -> OTCCloudEyeClient:
-    """Singleton-like access to the client, initializing if needed"""
+    """Singleton-like access to the client, initializing from clouds.yaml if needed"""
     global otc_client
     if otc_client:
         return otc_client
 
-    # Initialize from ENV
-    auth_url = os.getenv("OTC_AUTH_URL", "https://iam.eu-de.otc.t-systems.com/v3")
-    username = os.getenv("OTC_USERNAME")
-    password = os.getenv("OTC_PASSWORD")
-    domain_name = os.getenv("OTC_DOMAIN_NAME")
-    project_name = os.getenv("OTC_PROJECT_NAME")
-    region = os.getenv("OTC_REGION", "eu-de")
-    
-    if not all([username, password, domain_name, project_name]):
-        raise ValueError("Missing required environment variables (OTC_USERNAME, OTC_PASSWORD, OTC_DOMAIN_NAME, OTC_PROJECT_NAME)")
-    
-    logger.info(f"Initializing OTC Client for project: {project_name}")
-    client = OTCCloudEyeClient(auth_url, username, password, domain_name, project_name, region)
-    
-    if not client.authenticate():
-        raise RuntimeError("Initial authentication failed. Check credentials.")
-    
-    otc_client = client
-    return otc_client
+    try:
+        # Allow overriding the profile name via env var (default to 'otc')
+        cloud_profile = os.getenv("OS_CLOUD", "otc")
+        
+        config = load_clouds_yaml(cloud_profile)
+        
+        # Validation
+        required_fields = ["auth_url", "username", "password", "domain_name", "project_name"]
+        missing = [f for f in required_fields if not config.get(f)]
+        
+        if missing:
+            raise ValueError(f"Missing required fields in clouds.yaml for profile '{cloud_profile}': {', '.join(missing)}")
+        
+        logger.info(f"Initializing OTC Client for project: {config['project_name']} (Profile: {cloud_profile})")
+        client = OTCCloudEyeClient(
+            auth_url=config['auth_url'],
+            username=config['username'],
+            password=config['password'],
+            domain_name=config['domain_name'],
+            project_name=config['project_name'],
+            region=config['region']
+        )
+        
+        if not client.authenticate():
+            raise RuntimeError("Initial authentication failed. Check credentials in clouds.yaml.")
+        
+        otc_client = client
+        return otc_client
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize client: {e}")
+        raise
 
 # --- FastMCP Server Definition ---
 
-mcp = FastMCP("OTC Cloud Eye Complete", dependencies=["requests"])
+mcp = FastMCP("OTC Cloud Eye Complete", dependencies=["requests", "pyyaml"])
 
 @mcp.tool()
 def list_available_projects() -> str:
@@ -492,7 +570,6 @@ def get_single_metric_data(namespace: str, metric_name: str, instance_id: str,
 def get_combined_metrics_snapshot(instance_id: str, hours_back: int = 1) -> str:
     """
     Get a snapshot of ALL metrics (AGT and ECS) for a specific instance.
-    This replicates the '/combined-metrics-data' endpoint logic.
     Returns latest values and basic statistics for all configured metrics.
     """
     try:
@@ -560,11 +637,4 @@ def get_combined_metrics_snapshot(instance_id: str, hours_back: int = 1) -> str:
         return f"Error processing combined metrics: {str(e)}"
 
 if __name__ == "__main__":
-    # Check env vars locally before running (optional safety check)
-    required = ["OTC_USERNAME", "OTC_PASSWORD", "OTC_DOMAIN_NAME"]
-    missing = [v for v in required if not os.getenv(v)]
-    if missing:
-        print(f"WARNING: Missing environment variables: {missing}")
-        print("Ensure they are passed via 'env' in your MCP client configuration.")
-        
     mcp.run()
