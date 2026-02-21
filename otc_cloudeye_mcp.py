@@ -465,7 +465,9 @@ def get_client() -> OTCCloudEyeClient:
 
 # --- FastMCP Server Definition ---
 
-mcp = FastMCP("OTC Cloud Eye Complete", dependencies=["requests", "pyyaml"])
+# FIX: Removed 'dependencies' argument as it is no longer supported in newer FastMCP versions.
+# The dependencies are handled by the PEP 723 metadata at the top of the file.
+mcp = FastMCP("OTC Cloud Eye Complete")
 
 @mcp.tool()
 def list_available_projects() -> str:
